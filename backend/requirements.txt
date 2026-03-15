@@ -1,5 +1,5 @@
-# HelloAgents框架
-hello-agents[protocols]>=0.2.4
+langchain==1.2.12
+langgraph==1.1.2
 
 # FastAPI和相关依赖
 fastapi>=0.115.0
