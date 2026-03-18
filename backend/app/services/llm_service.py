@@ -41,7 +41,10 @@ def get_llm() -> ChatOpenAI:
         print(f"🔧 初始化 LLM 实例...")
         print(f"   模型: {model}")
         print(f"   服务地址: {base_url}")
-        print(f"   API Key: {api_key[:8]}...{api_key[-4:] if api_key else ''}")
+        if api_key:
+            print(f"   API Key: {api_key[:8]}...{api_key[-4:]}")
+        else:
+            print(f"   API Key: 未配置")
 
         _llm_instance = ChatOpenAI(
             api_key=api_key,
@@ -61,4 +64,3 @@ def reset_llm():
     """重置LLM实例(用于测试或重新配置)"""
     global _llm_instance
     _llm_instance = None
-

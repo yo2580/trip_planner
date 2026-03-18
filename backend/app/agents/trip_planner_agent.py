@@ -2,7 +2,7 @@
 
 import json
 import requests
-from typing import Dict, Any, List, Annotated, TypedDict
+from typing import Dict, Any, List, Annotated, TypedDict, Optional, Literal, Callable
 from datetime import datetime, timedelta
 
 from langchain_core.tools import tool
@@ -10,13 +10,14 @@ from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages  # 如果需要消息累加可启用
+from pydantic import BaseModel, Field
 
 from ..services.llm_service import get_llm
 from ..models.schemas import TripRequest, TripPlan, DayPlan, Attraction, Meal, WeatherInfo, Location, Hotel
 from ..config import get_settings
 
 
-# ============ LangChain 工具定义============
+# ============ LangChain 工具定义（替换原来的 MCPTool）============
 @tool
 def amap_maps_text_search(keywords: str, city: str) -> str:
     """高德地图文本搜索（景点/酒店通用）"""
@@ -174,9 +175,39 @@ PLANNER_AGENT_PROMPT = """你是行程规划专家。你的任务是根据景点
 """
 
 
+class AgentEnvelope(BaseModel):
+    sender: str
+    kind: Literal["TASK", "RESULT", "ERROR"]
+    task: str
+    recipient: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    ts: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+def _append_envelopes(left: Optional[List[Dict[str, Any]]], right: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    return (left or []) + (right or [])
+
+
+def _mk_msg(sender: str, kind: Literal["TASK", "RESULT", "ERROR"], task: str, payload: Dict[str, Any], recipient: Optional[str] = None) -> Dict[str, Any]:
+    return AgentEnvelope(sender=sender, kind=kind, task=task, payload=payload, recipient=recipient).model_dump()
+
+
+def _latest_msg(messages: List[Dict[str, Any]], *, kind: Optional[str] = None, task: Optional[str] = None, recipient: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    for m in reversed(messages):
+        if kind and m.get("kind") != kind:
+            continue
+        if task and m.get("task") != task:
+            continue
+        if recipient and m.get("recipient") != recipient:
+            continue
+        return m
+    return None
+
+
 
 # ============ Graph State 定义 ============
 class TripState(TypedDict):
+    messages: Annotated[List[Dict[str, Any]], _append_envelopes]
     request: TripRequest
     attraction_info: str
     weather_info: str
@@ -243,19 +274,22 @@ class MultiAgentTripPlanner:
             raise
 
     def _build_graph(self):
-        """构建 StateGraph (优化为并行架构)"""
+        """构建 StateGraph（核心协调 Agent + 专业化子 Agent + 结果聚合）"""
         graph = StateGraph(TripState)
 
         # 定义节点
+        graph.add_node("coordinator", self._coordinator_node)
         graph.add_node("attraction", self._attraction_node)
         graph.add_node("weather", self._weather_node)
         graph.add_node("hotel", self._hotel_node)
         graph.add_node("planner", self._planner_node)
 
+        graph.add_edge(START, "coordinator")
+
         # 并行执行（景点、天气、酒店搜索可以同时进行）
-        graph.add_edge(START, "attraction")
-        graph.add_edge(START, "weather")
-        graph.add_edge(START, "hotel")
+        graph.add_edge("coordinator", "attraction")
+        graph.add_edge("coordinator", "weather")
+        graph.add_edge("coordinator", "hotel")
         
         # 汇聚到行程规划器
         graph.add_edge("attraction", "planner")
@@ -267,39 +301,104 @@ class MultiAgentTripPlanner:
         return graph.compile()
 
     # ============== 各节点函数 ==============
+    def _coordinator_node(self, state: TripState) -> TripState:
+        req = state["request"]
+        print(f"🧩 [协调器] 开始任务拆分与调度: {req.city} {req.start_date}-{req.end_date}")
+
+        keywords = req.preferences[0] if req.preferences else "景点"
+        tasks = [
+            _mk_msg(
+                sender="coordinator",
+                kind="TASK",
+                task="attraction_search",
+                recipient="attraction_agent",
+                payload={"city": req.city, "keywords": keywords, "query": f"请搜索 {req.city} 的 {keywords} 相关景点。"},
+            ),
+            _mk_msg(
+                sender="coordinator",
+                kind="TASK",
+                task="weather_query",
+                recipient="weather_agent",
+                payload={"city": req.city, "query": f"请查询 {req.city} 的天气信息（覆盖旅行期间）。"},
+            ),
+            _mk_msg(
+                sender="coordinator",
+                kind="TASK",
+                task="hotel_search",
+                recipient="hotel_agent",
+                payload={"city": req.city, "accommodation": req.accommodation, "query": f"请搜索 {req.city} 的 {req.accommodation} 酒店（推荐经济型或中档）。"},
+            ),
+        ]
+        return {"messages": tasks}
+
     def _attraction_node(self, state: TripState) -> TripState:
         req = state["request"]
         print(f"🔍 [景点搜索] 正在为 {req.city} 寻找灵感...")
-        keywords = req.preferences[0] if req.preferences else "景点"
-        query = f"请搜索 {req.city} 的 {keywords} 相关景点。"
+        task = _latest_msg(state.get("messages", []), kind="TASK", task="attraction_search", recipient="attraction_agent")
+        query = task["payload"]["query"] if task and task.get("payload") else f"请搜索 {req.city} 的 景点 相关景点。"
 
         response = self.attraction_agent.invoke({"messages": [HumanMessage(content=query)]})
         print(f"✅ [景点搜索] 完成！已获取景点信息。")
-        return {"attraction_info": response["messages"][-1].content}
+        content = response["messages"][-1].content
+        return {
+            "attraction_info": content,
+            "messages": [
+                _mk_msg(sender="attraction_agent", kind="RESULT", task="attraction_search", recipient="coordinator", payload={"text": content})
+            ],
+        }
 
     def _weather_node(self, state: TripState) -> TripState:
         req = state["request"]
         print(f"🌤️ [天气查询] 正在获取 {req.city} 的最新天气预报...")
-        query = f"请查询 {req.city} 的天气信息（覆盖旅行期间）。"
+        task = _latest_msg(state.get("messages", []), kind="TASK", task="weather_query", recipient="weather_agent")
+        query = task["payload"]["query"] if task and task.get("payload") else f"请查询 {req.city} 的天气信息（覆盖旅行期间）。"
 
         response = self.weather_agent.invoke({"messages": [HumanMessage(content=query)]})
         print(f"✅ [天气查询] 完成！已获取天气数据。")
-        return {"weather_info": response["messages"][-1].content}
+        content = response["messages"][-1].content
+        return {
+            "weather_info": content,
+            "messages": [
+                _mk_msg(sender="weather_agent", kind="RESULT", task="weather_query", recipient="coordinator", payload={"text": content})
+            ],
+        }
 
     def _hotel_node(self, state: TripState) -> TripState:
         req = state["request"]
         print(f"🏨 [酒店推荐] 正在搜索 {req.city} 的合适住处...")
-        query = f"请搜索 {req.city} 的 {req.accommodation} 酒店（推荐经济型或中档）。"
+        task = _latest_msg(state.get("messages", []), kind="TASK", task="hotel_search", recipient="hotel_agent")
+        query = task["payload"]["query"] if task and task.get("payload") else f"请搜索 {req.city} 的 {req.accommodation} 酒店（推荐经济型或中档）。"
 
         response = self.hotel_agent.invoke({"messages": [HumanMessage(content=query)]})
         print(f"✅ [酒店推荐] 完成！已获取酒店推荐。")
-        return {"hotel_info": response["messages"][-1].content}
+        content = response["messages"][-1].content
+        return {
+            "hotel_info": content,
+            "messages": [
+                _mk_msg(sender="hotel_agent", kind="RESULT", task="hotel_search", recipient="coordinator", payload={"text": content})
+            ],
+        }
 
     def _planner_node(self, state: TripState) -> TripState:
         print(f"📝 [行程规划] 正在整合所有信息生成最终计划...")
         req = state["request"]
         
-        # 优化提示词，确保模型在 fallback 时也能输出 JSON
+        attraction_text = state.get("attraction_info", "")
+        weather_text = state.get("weather_info", "")
+        hotel_text = state.get("hotel_info", "")
+
+        attraction_msg = _latest_msg(state.get("messages", []), kind="RESULT", task="attraction_search")
+        weather_msg = _latest_msg(state.get("messages", []), kind="RESULT", task="weather_query")
+        hotel_msg = _latest_msg(state.get("messages", []), kind="RESULT", task="hotel_search")
+
+        if attraction_msg and attraction_msg.get("payload", {}).get("text"):
+            attraction_text = attraction_msg["payload"]["text"]
+        if weather_msg and weather_msg.get("payload", {}).get("text"):
+            weather_text = weather_msg["payload"]["text"]
+        if hotel_msg and hotel_msg.get("payload", {}).get("text"):
+            hotel_text = hotel_msg["payload"]["text"]
+
+        # 优化提示词，确保模型输出 JSON
         context = f"""
 基本信息：
 - 城市: {req.city}
@@ -308,39 +407,19 @@ class MultiAgentTripPlanner:
 - 偏好: {', '.join(req.preferences) if req.preferences else '无'}
 
 [景点参考]
-{state['attraction_info']}
+{attraction_text}
 
 [天气参考]
-{state['weather_info']}
+{weather_text}
 
 [酒店参考]
-{state['hotel_info']}
+{hotel_text}
 
 重要提示：请务必只输出一个符合 TripPlan 结构的合法 JSON 字符串。不要输出任何解释性文字。
 """
         try:
-            # 1. 尝试使用结构化输出 LLM 调用 (如果它不是原始 LLM 实例)
-            if self.planner_llm != self.llm:
-                try:
-                    print("  - 尝试使用 LLM 原生结构化输出接口...")
-                    response = self.planner_llm.invoke(PLANNER_AGENT_PROMPT + "\n\n" + context)
-                    
-                    # 如果返回已经是对象
-                    if isinstance(response, TripPlan):
-                        print(f"✅ [行程规划] 通过结构化接口成功生成计划。")
-                        return {"final_plan": response}
-                    
-                    # 否则提取内容
-                    content = response.content if hasattr(response, "content") else response
-                except Exception as structured_err:
-                    print(f"  ⚠️ 结构化输出接口调用失败: {structured_err}，尝试 Fallback 模式...")
-                    # 失败后使用原始 LLM
-                    response = self.llm.invoke(PLANNER_AGENT_PROMPT + "\n\n" + context + "\n请以 JSON 格式输出：")
-                    content = response.content if hasattr(response, "content") else response
-            else:
-                # 2. 直接使用原始 LLM 调用
-                response = self.llm.invoke(PLANNER_AGENT_PROMPT + "\n\n" + context + "\n请以 JSON 格式输出：")
-                content = response.content if hasattr(response, "content") else response
+            response = self.planner_agent.invoke({"messages": [HumanMessage(content=context)]})
+            content = response["messages"][-1].content
 
             # 3. 手动解析 JSON
             print("  - 正在解析 LLM 返回的 JSON 内容...")
@@ -386,7 +465,12 @@ class MultiAgentTripPlanner:
 
             plan = TripPlan.model_validate(raw_data)
             print(f"✅ [行程规划] 完成！最终旅行计划已生成。")
-            return {"final_plan": plan}
+            return {
+                "final_plan": plan,
+                "messages": [
+                    _mk_msg(sender="planner_agent", kind="RESULT", task="trip_plan", recipient="coordinator", payload={"plan": plan.model_dump()})
+                ],
+            }
             
         except Exception as e:
             print(f"❌ [行程规划] 最终失败: {str(e)}")
@@ -403,7 +487,7 @@ class MultiAgentTripPlanner:
             print(f"目的地: {request.city} | 天数: {request.travel_days}")
             print(f"{'='*60}\n")
 
-            initial_state: TripState = {"request": request}
+            initial_state: TripState = {"request": request, "messages": []}
             result = self.graph.invoke(initial_state)
 
             print(f"✅ 旅行计划生成完成！")
